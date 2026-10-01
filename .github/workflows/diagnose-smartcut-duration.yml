@@ -1,0 +1,63 @@
+name: Diagnose SmartCut Duration
+
+on:
+  push:
+    branches:
+      - fix/r0-smartcut-decode-tail
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Prepare FFmpeg runtime
+        shell: pwsh
+        run: |
+          ./scripts/fetch_ffmpeg.ps1
+
+      - name: Unit test SmartCut companion
+        shell: pwsh
+        run: |
+          python -m unittest tests.test_smartcut_companion_exact -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify fully-recoded head and tail segments
+        shell: pwsh
+        run: |
+          $ffmpeg = Join-Path $env:GITHUB_WORKSPACE "ffmpeg-runtime/ffmpeg.exe"
+          $cases = @(
+            @{ Name = "24"; Rate = "24"; Boundary = 97; Exact = "97/24"; Total = 177 },
+            @{ Name = "25"; Rate = "25"; Boundary = 101; Exact = "101/25"; Total = 181 },
+            @{ Name = "30000-1001"; Rate = "30000/1001"; Boundary = 121; Exact = "121121/30000"; Total = 201 },
+            @{ Name = "30"; Rate = "30"; Boundary = 121; Exact = "121/30"; Total = 201 },
+            @{ Name = "50"; Rate = "50"; Boundary = 201; Exact = "201/50"; Total = 281 }
+          )
+          New-Item -ItemType Directory -Path diag-smartcut -Force | Out-Null
+          foreach ($c in $cases) {
+            $src = Join-Path "diag-smartcut" ("source-" + $c.Name + ".mp4")
+            $part1 = Join-Path "diag-smartcut" ("part1-" + $c.Name + ".mp4")
+            $part2 = Join-Path "diag-smartcut" ("part2-" + $c.Name + ".mp4")
+            & $ffmpeg -v error -y -f lavfi -i ("testsrc2=s=64x64:r=" + $c.Rate) -frames:v $c.Total -c:v mpeg4 -q:v 1 -g 240 -bf 0 -pix_fmt yuv420p $src
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python smartcut_runner.py $src $part1 --keep ("start," + $c.Exact) --log-level warning
+            if ($LASTEXITCODE -ne 0) { throw "Part1 gagal pada rate $($c.Rate)" }
+            python smartcut_runner.py $src $part2 --keep ($c.Exact + ",end") --log-level warning
+            if ($LASTEXITCODE -ne 0) { throw "Part2 gagal pada rate $($c.Rate)" }
+            Write-Host ("PASS rate=" + $c.Rate + " exact=" + $c.Exact)
+          }
