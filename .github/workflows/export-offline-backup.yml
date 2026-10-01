@@ -1,0 +1,242 @@
+name: Export MiniCut Offline Backup
+
+on:
+  push:
+    branches:
+      - backup/offline-export
+
+permissions:
+  contents: read
+
+jobs:
+  export-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full repository history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build self-contained recovery package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p backup/package
+
+          # Fetch every branch and tag that still exists on GitHub.
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags --force
+
+          # Materialize every remote branch as a local head so the bundle contains
+          # ordinary refs/heads/* and can be mirror-restored to a brand-new repo.
+          while IFS= read -r remote_ref; do
+            name="${remote_ref#refs/remotes/origin/}"
+            [ "$name" = "HEAD" ] && continue
+            sha="$(git rev-parse "$remote_ref")"
+            git update-ref "refs/heads/$name" "$sha"
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/origin)
+
+          git for-each-ref --format='%(refname)' refs/heads refs/tags | sort > backup/REFS_TO_BACKUP.txt
+          mapfile -t refs < backup/REFS_TO_BACKUP.txt
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo 'No refs found to back up.' >&2
+            exit 1
+          fi
+
+          git bundle create backup/package/MINICUT_COMPLETE_GIT_HISTORY.bundle "${refs[@]}"
+          git bundle verify backup/package/MINICUT_COMPLETE_GIT_HISTORY.bundle
+
+          # Human-readable snapshot of current official main source.
+          git archive --format=zip --output=backup/package/MINICUT_SOURCE_MAIN.zip refs/heads/main
+
+          git rev-parse refs/heads/main > backup/package/MAIN_COMMIT.txt
+          git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags | sort > backup/package/ALL_BRANCHES_TAGS_AND_SHAS.txt
+          git log --graph --decorate --oneline --all > backup/package/HISTORY_ALL.txt
+          git fsck --full > backup/package/GIT_FSCK.txt 2>&1
+
+          cat > backup/package/README_RECOVERY.txt <<'EOF'
+          MINI-CUT — OFFLINE FULL SOURCE BACKUP
+          =====================================
+
+          Paket ini dibuat agar proyek dapat dipulihkan walaupun akun/repo GitHub lama
+          tidak dapat diakses lagi.
+
+          FILE PALING PENTING
+          -------------------
+          1. MINICUT_COMPLETE_GIT_HISTORY.bundle
+             Backup Git lengkap: source + seluruh branch + tag + riwayat commit yang
+             masih tersedia saat paket dibuat. Ini adalah sumber pemulihan utama.
+
+          2. MINICUT_SOURCE_MAIN.zip
+             Snapshot source branch main untuk pemeriksaan cepat tanpa Git.
+
+          3. MAIN_COMMIT.txt
+             Commit resmi branch main saat backup dibuat.
+
+          4. ALL_BRANCHES_TAGS_AND_SHAS.txt / HISTORY_ALL.txt
+             Manifest branch, tag, SHA dan histori untuk audit.
+
+          5. RESTORE_TO_NEW_GITHUB.ps1
+             Script Windows untuk mengembalikan bundle ke repo GitHub baru.
+
+          6. VERIFY_BACKUP.ps1
+             Memeriksa checksum dan validitas Git bundle sebelum dipakai.
+
+          CARA PULIHKAN JIKA GITHUB DISUSPEND
+          -----------------------------------
+          A. Buat repository KOSONG baru di akun GitHub yang aktif.
+             Jangan tambahkan README/LICENSE/.gitignore saat membuat repo.
+
+          B. Ekstrak paket backup ini ke satu folder Windows.
+
+          C. Buka PowerShell di folder itu, lalu jalankan:
+             powershell -ExecutionPolicy Bypass -File .\VERIFY_BACKUP.ps1
+
+          D. Jika hasil verifikasi PASS, jalankan:
+             powershell -ExecutionPolicy Bypass -File .\RESTORE_TO_NEW_GITHUB.ps1 -NewRepoUrl "https://github.com/AKUN-BARU/NAMA-REPO.git"
+
+          E. Script akan membuat mirror lokal dari bundle dan mendorong seluruh branch
+             dan tag ke repo baru. Setelah selesai, pastikan default branch di GitHub
+             adalah main.
+
+          CATATAN
+          -------
+          - Jangan hanya menyimpan file EXE/portable. Bundle adalah backup source utama.
+          - Simpan ZIP backup ini minimal di 2 tempat berbeda, misalnya SSD/flashdisk
+            dan cloud storage yang bukan GitHub.
+          - SHA256SUMS.txt digunakan untuk mengetahui apakah file backup rusak/berubah.
+          EOF
+
+          cat > backup/package/RESTORE_TO_NEW_GITHUB.ps1 <<'EOF'
+          param(
+            [Parameter(Mandatory=$true)]
+            [string]$NewRepoUrl,
+            [string]$Destination = "MINI-CUT-RESTORED-MIRROR.git"
+          )
+
+          $ErrorActionPreference = "Stop"
+          $Bundle = Join-Path $PSScriptRoot "MINICUT_COMPLETE_GIT_HISTORY.bundle"
+
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "Git tidak ditemukan. Instal Git for Windows terlebih dahulu."
+          }
+          if (-not (Test-Path $Bundle)) {
+            throw "Bundle tidak ditemukan: $Bundle"
+          }
+          if (Test-Path (Join-Path $PSScriptRoot $Destination)) {
+            throw "Folder tujuan sudah ada: $Destination. Hapus/ubah nama terlebih dahulu."
+          }
+
+          Write-Host "[1/4] Verifikasi Git bundle..."
+          git bundle verify $Bundle
+          if ($LASTEXITCODE -ne 0) { throw "git bundle verify gagal." }
+
+          Write-Host "[2/4] Membuat mirror lokal dari backup..."
+          git clone --mirror $Bundle (Join-Path $PSScriptRoot $Destination)
+          if ($LASTEXITCODE -ne 0) { throw "Clone bundle gagal." }
+
+          Push-Location (Join-Path $PSScriptRoot $Destination)
+          try {
+            Write-Host "[3/4] Mengarahkan mirror ke repo GitHub baru..."
+            git remote set-url origin $NewRepoUrl
+
+            Write-Host "[4/4] Push seluruh branch, tag, dan histori..."
+            git push --mirror origin
+            if ($LASTEXITCODE -ne 0) { throw "Push mirror ke GitHub baru gagal." }
+          }
+          finally {
+            Pop-Location
+          }
+
+          Write-Host "SELESAI. Source + branch + tag + histori sudah dikirim ke repo baru."
+          Write-Host "Pastikan default branch repo baru disetel ke main."
+          EOF
+
+          cat > backup/package/VERIFY_BACKUP.ps1 <<'EOF'
+          $ErrorActionPreference = "Stop"
+          $Bundle = Join-Path $PSScriptRoot "MINICUT_COMPLETE_GIT_HISTORY.bundle"
+          $ChecksumFile = Join-Path $PSScriptRoot "SHA256SUMS.txt"
+
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "Git tidak ditemukan. Instal Git for Windows terlebih dahulu."
+          }
+          if (-not (Test-Path $Bundle)) { throw "Git bundle tidak ditemukan." }
+          if (-not (Test-Path $ChecksumFile)) { throw "SHA256SUMS.txt tidak ditemukan." }
+
+          Write-Host "Verifikasi checksum SHA-256..."
+          Get-Content $ChecksumFile | ForEach-Object {
+            if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
+              $Expected = $matches[1].ToLower()
+              $Name = $matches[2]
+              $Path = Join-Path $PSScriptRoot $Name
+              if (-not (Test-Path $Path)) { throw "File hilang: $Name" }
+              $Actual = (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLower()
+              if ($Actual -ne $Expected) { throw "Checksum GAGAL: $Name" }
+              Write-Host "OK  $Name"
+            }
+          }
+
+          Write-Host "Verifikasi struktur Git bundle..."
+          git bundle verify $Bundle
+          if ($LASTEXITCODE -ne 0) { throw "Git bundle rusak/tidak valid." }
+          Write-Host "BACKUP PASS — aman dipakai untuk recovery."
+          EOF
+
+          cat > backup/package/MAKE_FRESH_BACKUP.ps1 <<'EOF'
+          param(
+            [Parameter(Mandatory=$true)]
+            [string]$RepoUrl,
+            [string]$OutputDir = "MINICUT-FRESH-BACKUP"
+          )
+
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw "Git tidak ditemukan. Instal Git for Windows terlebih dahulu."
+          }
+          $Out = Join-Path (Get-Location) $OutputDir
+          if (Test-Path $Out) { throw "Folder output sudah ada: $Out" }
+          New-Item -ItemType Directory -Path $Out | Out-Null
+          $Mirror = Join-Path $Out "mirror.git"
+
+          git clone --mirror $RepoUrl $Mirror
+          if ($LASTEXITCODE -ne 0) { throw "Clone mirror gagal." }
+          Push-Location $Mirror
+          try {
+            git fsck --full
+            if ($LASTEXITCODE -ne 0) { throw "git fsck gagal." }
+            git bundle create (Join-Path $Out "MINICUT_COMPLETE_GIT_HISTORY.bundle") --all
+            if ($LASTEXITCODE -ne 0) { throw "Pembuatan bundle gagal." }
+          }
+          finally { Pop-Location }
+          Write-Host "Backup Git baru selesai: $Out"
+          EOF
+
+          cat > backup/package/RESTORE_QUICK.bat <<'EOF'
+          @echo off
+          echo Gunakan PowerShell agar URL repo baru bisa diberikan dengan aman.
+          echo Contoh:
+          echo powershell -ExecutionPolicy Bypass -File RESTORE_TO_NEW_GITHUB.ps1 -NewRepoUrl "https://github.com/AKUN-BARU/NAMA-REPO.git"
+          pause
+          EOF
+
+          (
+            cd backup/package
+            sha256sum MINICUT_COMPLETE_GIT_HISTORY.bundle \
+                      MINICUT_SOURCE_MAIN.zip \
+                      MAIN_COMMIT.txt \
+                      ALL_BRANCHES_TAGS_AND_SHAS.txt \
+                      HISTORY_ALL.txt \
+                      GIT_FSCK.txt \
+                      README_RECOVERY.txt \
+                      RESTORE_TO_NEW_GITHUB.ps1 \
+                      VERIFY_BACKUP.ps1 \
+                      MAKE_FRESH_BACKUP.ps1 \
+                      RESTORE_QUICK.bat > SHA256SUMS.txt
+          )
+
+      - name: Upload offline recovery package
+        uses: actions/upload-artifact@v7
+        with:
+          name: MINI-CUT-OFFLINE-FULL-BACKUP
+          path: backup/package/
+          if-no-files-found: error
+          retention-days: 90
