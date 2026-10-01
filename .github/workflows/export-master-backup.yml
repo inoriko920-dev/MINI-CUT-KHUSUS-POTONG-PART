@@ -1,0 +1,73 @@
+name: Export MiniCut Master Backup
+
+on:
+  push:
+    branches:
+      - backup/offline-export
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export-master-backup:
+    runs-on: ubuntu-latest
+    env:
+      BACKUP_DATE: "2026-10-01"
+      EXPECTED_MAIN: "3dc14f5b9076cb8d53a65de3b90294a4703bed74"
+      BUILD_RUN_ID: "36886487973"
+      BUILD_ARTIFACT_DIR: ${{ github.workspace }}/build_artifact
+      BACKUP_OUTPUT_DIR: ${{ github.workspace }}/backup_output
+    steps:
+      - name: Checkout backup tooling branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Verify final build run belongs to official main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.head_sha')"
+          run_conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.conclusion')"
+          echo "Build run SHA: $run_sha"
+          echo "Build run conclusion: $run_conclusion"
+          test "$run_sha" = "$EXPECTED_MAIN"
+          test "$run_conclusion" = "success"
+
+      - name: Download verified Windows portable build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_ARTIFACT_DIR"
+          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" -n "MiniCut-Windows" -D "$BUILD_ARTIFACT_DIR"
+          test -s "$BUILD_ARTIFACT_DIR/MiniCut-Windows.zip"
+
+      - name: Build and verify self-contained master backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python backup_tools/build_master_backup.py | tee backup-export-result.txt
+          grep -q '^BACKUP_COMPLETE$' backup-export-result.txt
+          test -s "$BACKUP_OUTPUT_DIR/MASTER-BACKUP-MINICUT-${BACKUP_DATE}.zip"
+
+      - name: Upload final master backup
+        uses: actions/upload-artifact@v7
+        with:
+          name: MASTER-BACKUP-MINICUT-2026-10-01
+          path: backup_output/MASTER-BACKUP-MINICUT-2026-10-01.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload backup validation report
+        uses: actions/upload-artifact@v7
+        with:
+          name: MASTER-BACKUP-MINICUT-VALIDATION-2026-10-01
+          path: backup-export-result.txt
+          if-no-files-found: error
+          retention-days: 90
