@@ -9,19 +9,12 @@ Companion ini juga menjaga kontrak frame MiniCut untuk cut exact-PTS. MiniCut
 memetakan exact PTS ke indeks frame master tanpa toleransi lalu meneruskannya ke
 mode ``--frames`` resmi SmartCut.
 
-SmartCut 1.7 memiliki bug MP4 di ujung segmen: packet terakhir hasil recode dapat
-memiliki duration kosong/0 sehingga muxer membuat edit-list yang dapat membuat
-frame terakhir tidak terdecode. Upstream memperbaikinya setelah 1.7 dengan
-menyimpan duration packet valid sebelumnya dan menggunakannya pada packet yang
-duration-nya hilang. MiniCut membackport fix kecil itu di companion ini tanpa
-memodifikasi paket SmartCut yang terpasang.
-
-Sebagian file MP4 masih dapat kehilangan tepat satu frame terdecode di ujung
-segmen walaupun jumlah packet terlihat benar. Karena itu companion memverifikasi
-jumlah frame yang benar-benar terdecode. Jika percobaan exact normal kurang
-tepat satu frame dan segmen memiliki batas akhir non-terminal, companion
-mengulang sekali dengan satu frame input ekstra. Hasil retry hanya diterima bila
-jumlah frame terdecode kembali persis sama dengan kontrak MiniCut.
+Dependency SmartCut dipin ke upstream commit
+``9d8dbae57d1cad3597956e10cf746d3170adf72c``. Snapshot itu berada setelah
+perbaikan finalisasi GOP terakhir, kondisi finalisasi GOP, dan durasi frame yang
+valid. Companion tidak menambal algoritma encoding SmartCut; ia hanya menjaga
+kebijakan subtitle MiniCut, pemetaan exact frame, dan memverifikasi jumlah frame
+yang benar-benar dapat didecode sesudah ekspor.
 """
 
 from __future__ import annotations
@@ -35,11 +28,9 @@ from typing import Any
 
 import av
 from smartcut.media_container import MediaContainer
-from smartcut.cut_video import VideoCutter
 
 
 _original_media_container_init = MediaContainer.__init__
-_original_fix_packet_timestamps = VideoCutter._fix_packet_timestamps
 
 
 def _init_without_embedded_subtitles(self, *args, **kwargs):
@@ -50,30 +41,7 @@ def _init_without_embedded_subtitles(self, *args, **kwargs):
     self.subtitle_tracks = []
 
 
-def _ensure_packet_duration(cutter: Any, packet: Any) -> None:
-    """Backport upstream post-1.7 fix for missing final packet duration.
-
-    SmartCut upstream commit 9d8dbae57d1c added this policy because MP4 muxers
-    can create an edit-list that effectively drops the final decoded frame when
-    duration is missing/zero. Keep the last known positive duration and apply it
-    only when the current packet has no valid duration.
-    """
-    duration = getattr(packet, "duration", None)
-    if duration is not None and int(duration) > 0:
-        cutter.typical_frame_duration = int(duration)
-        return
-    typical = getattr(cutter, "typical_frame_duration", None)
-    if typical is not None and int(typical) > 0:
-        packet.duration = int(typical)
-
-
-def _fix_packet_timestamps_with_duration(self, packet):
-    _original_fix_packet_timestamps(self, packet)
-    _ensure_packet_duration(self, packet)
-
-
 MediaContainer.__init__ = _init_without_embedded_subtitles
-VideoCutter._fix_packet_timestamps = _fix_packet_timestamps_with_duration
 
 from smartcut.__main__ import main as _smartcut_main  # noqa: E402
 
@@ -86,7 +54,6 @@ _TERMINAL_END = {"e", "end", "-0"}
 class _ExactKeepPlan:
     expected_frames: int
     frame_keep: str
-    recovery_frame_keep: str | None
 
 
 def _as_fraction(value: Any) -> Fraction:
@@ -180,18 +147,12 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
     else:
         start_index = _exact_frame_index(source, start_raw)
 
-    recovery_frame_keep: str | None = None
     if end_raw.lower() in _TERMINAL_END:
         end_exclusive = total_frames
         end_frame_inclusive = -1
     else:
         end_exclusive = _exact_frame_index(source, end_raw)
         end_frame_inclusive = end_exclusive - 1
-        # Recovery-only form. SmartCut receives one extra source frame so an MP4
-        # edit-list/drop at the tail can consume that sacrificial frame instead
-        # of the final frame that belongs to this part. We only use this after
-        # decoded-frame verification proves the normal form is short by exactly 1.
-        recovery_frame_keep = f"{start_index},{end_exclusive}"
 
     expected = end_exclusive - start_index
     if expected <= 0:
@@ -201,11 +162,10 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
 
     # SmartCut --frames treats the second number as the final INCLUDED frame and
     # internally converts it to the next frame's timestamp. Therefore [K, L)
-    # maps normally to "K,L-1". -1 is SmartCut's documented final-frame token.
+    # maps exactly to "K,L-1". -1 is SmartCut's documented final-frame token.
     return _ExactKeepPlan(
         expected_frames=expected,
         frame_keep=f"{start_index},{end_frame_inclusive}",
-        recovery_frame_keep=recovery_frame_keep,
     )
 
 
@@ -261,32 +221,11 @@ def main() -> None:
 
     output = Path(argv[1])
     actual = _run_and_count_decoded(argv, plan.frame_keep, output)
-    if actual == plan.expected_frames:
-        return
-
-    # SmartCut 1.7 can produce the correct packet count while MP4 decoding drops
-    # the final frame. Recover only the exact known shape: one decoded frame
-    # missing at a non-terminal end boundary. Any other mismatch remains fatal.
-    if (
-        actual == plan.expected_frames - 1
-        and plan.recovery_frame_keep is not None
-    ):
-        recovered = _run_and_count_decoded(
-            argv,
-            plan.recovery_frame_keep,
-            output,
-        )
-        if recovered == plan.expected_frames:
-            return
+    if actual != plan.expected_frames:
         raise RuntimeError(
-            "SmartCut retry boundary exact tetap tidak sesuai jumlah frame terdecode: "
-            f"awal {actual}, retry {recovered}, seharusnya {plan.expected_frames}."
+            "SmartCut menghasilkan jumlah frame terdecode yang tidak sesuai boundary exact: "
+            f"hasil {actual}, seharusnya {plan.expected_frames}."
         )
-
-    raise RuntimeError(
-        "SmartCut menghasilkan jumlah frame terdecode yang tidak sesuai boundary exact: "
-        f"hasil {actual}, seharusnya {plan.expected_frames}."
-    )
 
 
 if __name__ == "__main__":
