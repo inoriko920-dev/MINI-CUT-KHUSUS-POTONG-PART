@@ -1,8 +1,12 @@
-MiniCut Studio Agent includes the open-source "smartcut" 1.7 command-line engine
-for frame-accurate cutting with minimal recoding around cut points.
+MiniCut Studio Agent includes an open-source SmartCut source snapshot pinned to
+upstream commit 9d8dbae57d1cad3597956e10cf746d3170adf72c for frame-accurate cutting with
+minimal recoding around cut points. The upstream project metadata at this commit
+still reports version 1.7. This snapshot is intentionally newer than the v1.7
+release tag and includes upstream fixes for final-GOP finalization and valid
+frame duration handling.
 
 Project: https://github.com/skeskinen/smartcut
-Package: https://pypi.org/project/smartcut/
+Pinned commit: https://github.com/skeskinen/smartcut/commit/9d8dbae57d1cad3597956e10cf746d3170adf72c
 License: MIT
 
 MIT License

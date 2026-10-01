@@ -1,5 +1,5 @@
 PySide6>=6.7,<7
 mcp>=1.12,<2
 tzdata>=2025.2
-smartcut==1.7
+smartcut @ git+https://github.com/skeskinen/smartcut.git@9d8dbae57d1cad3597956e10cf746d3170adf72c
 python-mpv==1.0.8

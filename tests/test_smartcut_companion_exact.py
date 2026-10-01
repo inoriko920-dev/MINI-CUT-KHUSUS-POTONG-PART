@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from fractions import Fraction
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import smartcut_runner
@@ -24,6 +25,61 @@ class _FakeSource:
         self.closed = True
 
 
+class SmartCutPacketDurationSeedTests(unittest.TestCase):
+    def test_duration_seed_uses_master_pts_delta_without_rounding(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 512, 1024, 1536])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 12288),
+                Fraction(1, 12288),
+            ),
+            512,
+        )
+
+    def test_duration_seed_converts_exactly_to_output_time_base(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1001, 2002, 3003])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 30000),
+                Fraction(1, 90000),
+            ),
+            3003,
+        )
+
+    def test_duration_seed_uses_most_common_positive_delta(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1000, 2001, 3001, 4001])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 1000),
+                Fraction(1, 1000),
+            ),
+            1000,
+        )
+
+    def test_duration_seed_refuses_fractional_output_tick(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1, 2])
+        self.assertIsNone(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 3),
+                Fraction(1, 2),
+            )
+        )
+
+    def test_duration_seed_requires_two_master_pts(self):
+        media = SimpleNamespace(video_frame_times_pts=[123])
+        self.assertIsNone(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 24),
+                Fraction(1, 24),
+            )
+        )
+
+
 class SmartCutExactFramePlanTests(unittest.TestCase):
     def test_exact_boundary_maps_to_master_frame_index_without_tolerance(self):
         source = _FakeSource()
@@ -38,8 +94,6 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
         source = _FakeSource()
         plan = smartcut_runner._build_exact_keep_plan(source, "start,97/24")
         self.assertEqual(plan.expected_frames, 97)
-        # MiniCut [0,97) becomes SmartCut --frames 0,96. SmartCut itself
-        # advances the inclusive end frame to the next PTS internally.
         self.assertEqual(plan.frame_keep, "0,96")
 
     def test_part_after_boundary_starts_at_k_and_keeps_remaining_frames(self):
@@ -79,60 +133,46 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
 
 
 class SmartCutExactFrameExecutionTests(unittest.TestCase):
-    def test_main_uses_official_frame_mode_for_exact_staging_output(self):
-        source = _FakeSource()
-        argv = [
+    def _argv(self, keep: str = "start,97/24") -> list[str]:
+        return [
             "MiniCut SmartCut.exe",
             "movie.mp4",
             ".movie_Part-01.minicut-stage-abc.mp4",
             "--keep",
-            "start,97/24",
+            keep,
             "--log-level",
             "warning",
         ]
-        runs: list[list[str]] = []
 
-        def record_run(args):
-            runs.append(list(args))
+    def test_main_uses_official_frame_mode_and_accepts_matching_decode_count(self):
+        source = _FakeSource()
+        runs: list[tuple[str, str]] = []
 
-        with patch.object(sys, "argv", argv), patch(
+        def fake_run_and_count(argv, keep, output):
+            runs.append((keep, str(output)))
+            return 97
+
+        with patch.object(sys, "argv", self._argv()), patch(
             "smartcut_runner.MediaContainer",
             return_value=source,
         ), patch(
-            "smartcut_runner._run_upstream",
-            side_effect=record_run,
-        ), patch(
-            "smartcut_runner._video_frame_count",
-            return_value=97,
+            "smartcut_runner._run_and_count_decoded",
+            side_effect=fake_run_and_count,
         ):
             smartcut_runner.main()
 
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(
-            runs[0][runs[0].index("--keep") + 1],
-            "0,96",
-        )
-        self.assertIn("--frames", runs[0])
+        self.assertEqual(runs, [("0,96", ".movie_Part-01.minicut-stage-abc.mp4")])
 
-    def test_main_rejects_output_frame_count_mismatch(self):
+    def test_main_rejects_decoded_output_frame_count_mismatch(self):
         source = _FakeSource()
-        argv = [
-            "MiniCut SmartCut.exe",
-            "movie.mp4",
-            ".movie_Part-01.minicut-stage-abc.mp4",
-            "--keep",
-            "start,97/24",
-        ]
-        with patch.object(sys, "argv", argv), patch(
+        with patch.object(sys, "argv", self._argv()), patch(
             "smartcut_runner.MediaContainer",
             return_value=source,
         ), patch(
-            "smartcut_runner._run_upstream",
-        ), patch(
-            "smartcut_runner._video_frame_count",
-            return_value=95,
+            "smartcut_runner._run_and_count_decoded",
+            return_value=96,
         ):
-            with self.assertRaisesRegex(RuntimeError, "jumlah frame"):
+            with self.assertRaisesRegex(RuntimeError, "jumlah frame terdecode"):
                 smartcut_runner.main()
 
 
