@@ -7,21 +7,24 @@ SRT hasil MiniCut.
 
 Companion ini juga menjaga kontrak frame MiniCut untuk cut exact-PTS. MiniCut
 memetakan exact PTS ke indeks frame master tanpa toleransi lalu meneruskannya ke
-mode ``--frames`` resmi SmartCut. Mode itu memang menambahkan satu frame pada
-batas akhir sebelum memanggil engine SmartCut, sehingga rentang [K, L) tetap
-menghasilkan frame K sampai L-1 tanpa menggeser boundary semantik. Hasil tetap
-diverifikasi terhadap jumlah frame master; mismatch menjadi hard failure.
+mode ``--frames`` resmi SmartCut. Setelah ekspor, companion tidak hanya percaya
+jumlah packet/PTS: GOP terakhir benar-benar didekode dengan PyAV. Jika dan hanya
+jika satu frame akhir terbukti tidak dapat didekode, end boundary diulang dengan
+satu source frame tambahan sebagai frame pengorbanan. Retry harus menghasilkan
+jumlah frame efektif yang tepat; mismatch lain selalu menjadi hard failure.
 """
 
 from __future__ import annotations
 
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import av
 from smartcut.media_container import MediaContainer
 
 
@@ -49,6 +52,26 @@ _TERMINAL_END = {"e", "end", "-0"}
 class _ExactKeepPlan:
     expected_frames: int
     frame_keep: str
+    retry_frame_keep: str | None
+
+
+@dataclass(frozen=True)
+class _OutputDecodeStats:
+    packet_frames: int
+    tail_packets: int
+    tail_decoded: int
+
+    @property
+    def tail_missing(self) -> int:
+        return max(0, self.tail_packets - self.tail_decoded)
+
+    @property
+    def effective_decoded_frames(self) -> int:
+        # SmartCut's MediaContainer counts packet PTS. The reproduced R0 bug is
+        # a packet at the final edge that exists in the container but does not
+        # produce a decoded frame. Decode only the final GOP and subtract that
+        # proven tail deficit from the lightweight packet count.
+        return max(0, self.packet_frames - self.tail_missing)
 
 
 def _as_fraction(value: Any) -> Fraction:
@@ -146,12 +169,19 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
     else:
         start_index = _exact_frame_index(source, start_raw)
 
+    retry_frame_keep: str | None = None
     if end_raw.lower() in _TERMINAL_END:
         end_exclusive = total_frames
         end_frame_inclusive = -1
     else:
         end_exclusive = _exact_frame_index(source, end_raw)
         end_frame_inclusive = end_exclusive - 1
+        # A retry is permitted only when another source frame really exists.
+        # That next frame is never accepted as content; it is exposed solely as
+        # a sacrificial frame if decode verification proves SmartCut discarded
+        # the desired final frame at the exact boundary.
+        if end_exclusive < total_frames:
+            retry_frame_keep = f"{start_index},{end_exclusive}"
 
     expected = end_exclusive - start_index
     if expected <= 0:
@@ -166,15 +196,86 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
     return _ExactKeepPlan(
         expected_frames=expected,
         frame_keep=frame_keep,
+        retry_frame_keep=retry_frame_keep,
     )
 
 
-def _video_frame_count(path: Path) -> int:
-    media = MediaContainer(str(path))
+def _output_decode_stats(path: Path) -> _OutputDecodeStats:
+    """Count packet PTS cheaply, but decode the final GOP for truth.
+
+    SmartCut/MediaContainer inventory is packet based. A malformed/truncated
+    final GOP can therefore report N packet timestamps while a real decoder only
+    yields N-1 frames. We scan packets (cheap), remember only the final GOP, then
+    reopen and seek to its keyframe so normal production validation decodes a
+    bounded tail rather than an entire movie part.
+    """
+    packet_pts: list[int] = []
+    tail_pts: list[int] = []
+    last_keyframe_pts: int | None = None
+
+    container = av.open(str(path), mode="r")
     try:
-        return len(getattr(media, "video_frame_times_pts", []))
+        if not container.streams.video:
+            raise RuntimeError("Output SmartCut tidak memiliki video stream.")
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.pts is None:
+                continue
+            pts = int(packet.pts)
+            packet_pts.append(pts)
+            if packet.is_keyframe:
+                last_keyframe_pts = pts
+                tail_pts = [pts]
+            elif last_keyframe_pts is None:
+                # Provisional pre-keyframe tail. It is discarded as soon as a
+                # real keyframe is encountered; if the file has no keyframe at
+                # all, full decode below is the safe fallback.
+                tail_pts.append(pts)
+            else:
+                tail_pts.append(pts)
     finally:
-        media.close()
+        container.close()
+
+    if not packet_pts:
+        raise RuntimeError("Output SmartCut tidak memiliki packet video ber-PTS.")
+    if not tail_pts:
+        tail_pts = list(packet_pts)
+
+    wanted = Counter(tail_pts)
+    decoded = Counter()
+    decoder = av.open(str(path), mode="r")
+    try:
+        if not decoder.streams.video:
+            raise RuntimeError("Output SmartCut tidak memiliki video stream saat decode.")
+        stream = decoder.streams.video[0]
+        if last_keyframe_pts is not None:
+            # PyAV interprets the offset in stream.time_base when stream= is
+            # supplied and seeks backward to a keyframe. Starting at/before the
+            # remembered final keyframe gives the decoder all references needed.
+            decoder.seek(
+                int(last_keyframe_pts),
+                stream=stream,
+                backward=True,
+                any_frame=False,
+            )
+        for frame in decoder.decode(stream):
+            if frame.pts is None:
+                continue
+            pts = int(frame.pts)
+            if pts in wanted:
+                decoded[pts] += 1
+    finally:
+        decoder.close()
+
+    matched = sum(
+        min(count, decoded.get(pts, 0))
+        for pts, count in wanted.items()
+    )
+    return _OutputDecodeStats(
+        packet_frames=len(packet_pts),
+        tail_packets=len(tail_pts),
+        tail_decoded=matched,
+    )
 
 
 def _run_upstream(argv: list[str]) -> None:
@@ -195,6 +296,28 @@ def _replace_keep_with_frames(argv: list[str], keep: str) -> list[str]:
     return rewritten
 
 
+def _initial_output_is_exact(stats: _OutputDecodeStats, expected: int) -> bool:
+    return (
+        stats.packet_frames == expected
+        and stats.tail_missing == 0
+        and stats.effective_decoded_frames == expected
+    )
+
+
+def _retry_output_is_exact(stats: _OutputDecodeStats, expected: int) -> bool:
+    # Ideal retry shape for the reproduced SmartCut bug: one deliberately extra
+    # packet/frame is exposed, the broken tail consumes exactly one, and exactly
+    # N desired frames remain decodable. Some codecs/muxers may clip the extra
+    # packet themselves; the ordinary exact N/N shape is safe too.
+    sacrificed_one = (
+        stats.packet_frames == expected + 1
+        and stats.tail_missing == 1
+        and stats.effective_decoded_frames == expected
+    )
+    clipped_to_exact = _initial_output_is_exact(stats, expected)
+    return sacrificed_one or clipped_to_exact
+
+
 def main() -> None:
     argv = list(sys.argv[1:])
     if not _looks_like_minicut_exact_keep(argv):
@@ -209,20 +332,47 @@ def main() -> None:
     finally:
         source.close()
 
-    # SmartCut already provides the correct end-frame compensation in its
-    # documented --frames mode. Convert MiniCut's verified exact PTS to those
-    # frame indices rather than reimplementing the compensation with timestamps.
     exact_frame_argv = _replace_keep_with_frames(argv, plan.frame_keep)
     _run_upstream(exact_frame_argv)
 
     output = Path(argv[1])
-    actual = _video_frame_count(output)
-    if actual == plan.expected_frames:
+    stats = _output_decode_stats(output)
+    if _initial_output_is_exact(stats, plan.expected_frames):
         return
 
+    # Never apply a blanket +/- one-frame correction. Retry is allowed only for
+    # the single reproduced signature: packet inventory is exactly right, the
+    # decoded final GOP proves exactly one frame missing, and a source frame
+    # exists after the requested end boundary to act as a disposable cushion.
+    can_retry_one = (
+        plan.retry_frame_keep is not None
+        and stats.packet_frames == plan.expected_frames
+        and stats.tail_missing == 1
+        and stats.effective_decoded_frames == plan.expected_frames - 1
+    )
+    if can_retry_one:
+        retry_argv = _replace_keep_with_frames(argv, plan.retry_frame_keep)
+        try:
+            output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _run_upstream(retry_argv)
+        retry_stats = _output_decode_stats(output)
+        if _retry_output_is_exact(retry_stats, plan.expected_frames):
+            return
+        raise RuntimeError(
+            "SmartCut retry satu-frame tidak menghasilkan boundary exact: "
+            f"packet={retry_stats.packet_frames}, "
+            f"tail_missing={retry_stats.tail_missing}, "
+            f"decoded_efektif={retry_stats.effective_decoded_frames}, "
+            f"seharusnya={plan.expected_frames}."
+        )
+
     raise RuntimeError(
-        "SmartCut menghasilkan jumlah frame yang tidak sesuai boundary exact: "
-        f"hasil {actual}, seharusnya {plan.expected_frames}."
+        "SmartCut menghasilkan boundary yang tidak lolos verifikasi decode: "
+        f"packet={stats.packet_frames}, tail_missing={stats.tail_missing}, "
+        f"decoded_efektif={stats.effective_decoded_frames}, "
+        f"seharusnya={plan.expected_frames}."
     )
 
 
