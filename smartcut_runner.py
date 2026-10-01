@@ -5,13 +5,12 @@ upstream secara default ikut menyalin subtitle stream internal dari container
 sumber. Itu dapat membuat player menampilkan subtitle lama/embedded alih-alih
 SRT hasil MiniCut.
 
-Companion ini juga menjaga kontrak frame MiniCut untuk cut exact-PTS. SmartCut
-1.7 pada beberapa codec/GOP dapat membuang frame terakhir segmen ketika end
-time tepat berada pada PTS frame berikutnya. MiniCut memverifikasi jumlah frame
-hasil terhadap indeks PTS master. Bila tepat satu frame akhir hilang, companion
-mengulang segmen dengan end-time satu frame master sesudah boundary. Hasil retry
-harus memiliki jumlah frame persis; selain itu ekspor gagal, tidak pernah snap
-atau menerima hasil yang ambigu.
+Companion ini juga menjaga kontrak frame MiniCut untuk cut exact-PTS. MiniCut
+memetakan exact PTS ke indeks frame master tanpa toleransi lalu meneruskannya ke
+mode ``--frames`` resmi SmartCut. Mode itu memang menambahkan satu frame pada
+batas akhir sebelum memanggil engine SmartCut, sehingga rentang [K, L) tetap
+menghasilkan frame K sampai L-1 tanpa menggeser boundary semantik. Hasil tetap
+diverifikasi terhadap jumlah frame master; mismatch menjadi hard failure.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ _TERMINAL_END = {"e", "end", "-0"}
 @dataclass(frozen=True)
 class _ExactKeepPlan:
     expected_frames: int
-    retry_keep: str | None
+    frame_keep: str
 
 
 def _as_fraction(value: Any) -> Fraction:
@@ -90,8 +89,8 @@ def _looks_like_minicut_exact_keep(argv: list[str]) -> bool:
     # not necessarily see the final "*_Part-01.mp4" name. Exact MiniCut calls
     # already have an unambiguous contract: exact PTS values are emitted as
     # canonical Fraction text (integer or n/d), while non-exact fallback times
-    # are fixed decimal strings. This keeps staging, retry and final export on
-    # the same exact-frame validation path.
+    # are fixed decimal strings. This keeps staging and final export on the same
+    # exact-frame validation path.
     non_terminal = [
         value for value in values
         if value.lower() not in _TERMINAL_START | _TERMINAL_END
@@ -106,14 +105,6 @@ def _video_time_base(source: MediaContainer) -> Fraction:
     if stream is None or getattr(stream, "time_base", None) is None:
         raise RuntimeError("Video SmartCut tidak memiliki time_base untuk verifikasi PTS.")
     return _as_fraction(stream.time_base)
-
-
-def _relative_frame_time(source: MediaContainer, index: int) -> Fraction:
-    pts_values = getattr(source, "video_frame_times_pts", None)
-    if pts_values is None or index < 0 or index >= len(pts_values):
-        raise IndexError("Index frame master di luar rentang video.")
-    absolute = Fraction(int(pts_values[index])) * _video_time_base(source)
-    return absolute - _as_fraction(getattr(source, "start_time", Fraction(0)))
 
 
 def _exact_frame_index(source: MediaContainer, exact_time: str) -> int:
@@ -155,25 +146,27 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
     else:
         start_index = _exact_frame_index(source, start_raw)
 
-    retry_keep: str | None = None
     if end_raw.lower() in _TERMINAL_END:
         end_exclusive = total_frames
+        end_frame_inclusive = -1
     else:
         end_exclusive = _exact_frame_index(source, end_raw)
-        # SmartCut 1.7 sometimes drops the final desired frame when the end is
-        # exactly this boundary. Retry may expose one additional source frame to
-        # the muxer; output validation below requires the exact expected count.
-        next_index = end_exclusive + 1
-        if next_index < total_frames:
-            retry_end = _relative_frame_time(source, next_index)
-            retry_keep = f"{start_raw},{retry_end}"
+        end_frame_inclusive = end_exclusive - 1
 
     expected = end_exclusive - start_index
     if expected <= 0:
         raise RuntimeError(
             f"Rentang exact SmartCut tidak valid: start={start_raw}, end={end_raw}."
         )
-    return _ExactKeepPlan(expected_frames=expected, retry_keep=retry_keep)
+
+    # SmartCut --frames treats the second number as the final INCLUDED frame and
+    # internally converts it to the next frame's timestamp. Therefore [K, L)
+    # maps exactly to "K,L-1". -1 is SmartCut's documented final-frame token.
+    frame_keep = f"{start_index},{end_frame_inclusive}"
+    return _ExactKeepPlan(
+        expected_frames=expected,
+        frame_keep=frame_keep,
+    )
 
 
 def _video_frame_count(path: Path) -> int:
@@ -193,10 +186,12 @@ def _run_upstream(argv: list[str]) -> None:
         sys.argv = previous
 
 
-def _replace_keep(argv: list[str], keep: str) -> list[str]:
+def _replace_keep_with_frames(argv: list[str], keep: str) -> list[str]:
     rewritten = list(argv)
     index = rewritten.index("--keep")
     rewritten[index + 1] = keep
+    if "--frames" not in rewritten:
+        rewritten.append("--frames")
     return rewritten
 
 
@@ -214,23 +209,16 @@ def main() -> None:
     finally:
         source.close()
 
-    _run_upstream(argv)
+    # SmartCut already provides the correct end-frame compensation in its
+    # documented --frames mode. Convert MiniCut's verified exact PTS to those
+    # frame indices rather than reimplementing the compensation with timestamps.
+    exact_frame_argv = _replace_keep_with_frames(argv, plan.frame_keep)
+    _run_upstream(exact_frame_argv)
+
     output = Path(argv[1])
     actual = _video_frame_count(output)
     if actual == plan.expected_frames:
         return
-
-    # Only compensate the precise SmartCut 1.7 failure we reproduced: exactly
-    # one final frame missing. Any other mismatch is a hard failure.
-    if actual == plan.expected_frames - 1 and plan.retry_keep:
-        _run_upstream(_replace_keep(argv, plan.retry_keep))
-        retry_actual = _video_frame_count(output)
-        if retry_actual == plan.expected_frames:
-            return
-        raise RuntimeError(
-            "SmartCut retry exact-frame tetap tidak cocok: "
-            f"hasil {retry_actual}, seharusnya {plan.expected_frames}."
-        )
 
     raise RuntimeError(
         "SmartCut menghasilkan jumlah frame yang tidak sesuai boundary exact: "
