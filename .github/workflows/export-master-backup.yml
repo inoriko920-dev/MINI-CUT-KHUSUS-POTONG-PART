@@ -55,13 +55,16 @@ jobs:
           python backup_tools/build_master_backup.py | tee backup-export-result.txt
           grep -q '^BACKUP_COMPLETE$' backup-export-result.txt
           test -s "$BACKUP_OUTPUT_DIR/MASTER-BACKUP-MINICUT-${BACKUP_DATE}.zip"
+          test -d "$BACKUP_OUTPUT_DIR/MASTER-BACKUP-MINICUT-${BACKUP_DATE}"
 
-      - name: Upload final master backup
+      - name: Upload final master backup as one ZIP artifact
         uses: actions/upload-artifact@v7
         with:
           name: MASTER-BACKUP-MINICUT-2026-10-01
-          path: backup_output/MASTER-BACKUP-MINICUT-2026-10-01.zip
+          path: backup_output/MASTER-BACKUP-MINICUT-2026-10-01/
           if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
           retention-days: 90
 
       - name: Upload backup validation report
