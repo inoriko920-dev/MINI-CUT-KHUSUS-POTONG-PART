@@ -75,7 +75,7 @@ jobs:
         shell: pwsh
         env:
           MINICUT_FFMPEG: ${{ github.workspace }}\ffmpeg-runtime\ffmpeg.exe
-          MINICUT_FFPROBE: ${{ github.workspace }}\ffprobe.exe
+          MINICUT_FFPROBE: ${{ github.workspace }}\ffmpeg-runtime\ffprobe.exe
         run: |
           python -m unittest discover -s tests -v
 
@@ -126,7 +126,7 @@ jobs:
         shell: pwsh
         env:
           MINICUT_FFMPEG: ${{ github.workspace }}\ffmpeg-runtime\ffmpeg.exe
-          MINICUT_FFPROBE: ${{ github.workspace }}\ffprobe.exe
+          MINICUT_FFPROBE: ${{ github.workspace }}\ffmpeg-runtime\ffprobe.exe
           MINICUT_SMARTCUT_EXE: ${{ github.workspace }}\dist\MiniCut Studio Agent\MiniCut SmartCut.exe
         run: |
           python -m unittest discover -s tests -p "test_camera_boundary_integration.py" -v
