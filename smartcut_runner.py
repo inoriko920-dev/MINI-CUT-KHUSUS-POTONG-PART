@@ -15,6 +15,13 @@ frame terakhir tidak terdecode. Upstream memperbaikinya setelah 1.7 dengan
 menyimpan duration packet valid sebelumnya dan menggunakannya pada packet yang
 duration-nya hilang. MiniCut membackport fix kecil itu di companion ini tanpa
 memodifikasi paket SmartCut yang terpasang.
+
+Sebagian file MP4 masih dapat kehilangan tepat satu frame terdecode di ujung
+segmen walaupun jumlah packet terlihat benar. Karena itu companion memverifikasi
+jumlah frame yang benar-benar terdecode. Jika percobaan exact normal kurang
+tepat satu frame dan segmen memiliki batas akhir non-terminal, companion
+mengulang sekali dengan satu frame input ekstra. Hasil retry hanya diterima bila
+jumlah frame terdecode kembali persis sama dengan kontrak MiniCut.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import av
 from smartcut.media_container import MediaContainer
 from smartcut.cut_video import VideoCutter
 
@@ -78,6 +86,7 @@ _TERMINAL_END = {"e", "end", "-0"}
 class _ExactKeepPlan:
     expected_frames: int
     frame_keep: str
+    recovery_frame_keep: str | None
 
 
 def _as_fraction(value: Any) -> Fraction:
@@ -171,12 +180,18 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
     else:
         start_index = _exact_frame_index(source, start_raw)
 
+    recovery_frame_keep: str | None = None
     if end_raw.lower() in _TERMINAL_END:
         end_exclusive = total_frames
         end_frame_inclusive = -1
     else:
         end_exclusive = _exact_frame_index(source, end_raw)
         end_frame_inclusive = end_exclusive - 1
+        # Recovery-only form. SmartCut receives one extra source frame so an MP4
+        # edit-list/drop at the tail can consume that sacrificial frame instead
+        # of the final frame that belongs to this part. We only use this after
+        # decoded-frame verification proves the normal form is short by exactly 1.
+        recovery_frame_keep = f"{start_index},{end_exclusive}"
 
     expected = end_exclusive - start_index
     if expected <= 0:
@@ -186,19 +201,24 @@ def _build_exact_keep_plan(source: MediaContainer, keep: str) -> _ExactKeepPlan:
 
     # SmartCut --frames treats the second number as the final INCLUDED frame and
     # internally converts it to the next frame's timestamp. Therefore [K, L)
-    # maps exactly to "K,L-1". -1 is SmartCut's documented final-frame token.
+    # maps normally to "K,L-1". -1 is SmartCut's documented final-frame token.
     return _ExactKeepPlan(
         expected_frames=expected,
         frame_keep=f"{start_index},{end_frame_inclusive}",
+        recovery_frame_keep=recovery_frame_keep,
     )
 
 
-def _video_frame_count(path: Path) -> int:
-    media = MediaContainer(str(path))
+def _decoded_video_frame_count(path: Path) -> int:
+    """Count frames the decoder actually yields, not merely indexed packets."""
+    container = av.open(str(path), mode="r")
     try:
-        return len(getattr(media, "video_frame_times_pts", []))
+        if not container.streams.video:
+            raise RuntimeError("Output SmartCut tidak memiliki video stream.")
+        stream = container.streams.video[0]
+        return sum(1 for _frame in container.decode(stream))
     finally:
-        media.close()
+        container.close()
 
 
 def _run_upstream(argv: list[str]) -> None:
@@ -219,6 +239,12 @@ def _replace_keep_with_frames(argv: list[str], keep: str) -> list[str]:
     return rewritten
 
 
+def _run_and_count_decoded(argv: list[str], keep: str, output: Path) -> int:
+    output.unlink(missing_ok=True)
+    _run_upstream(_replace_keep_with_frames(argv, keep))
+    return _decoded_video_frame_count(output)
+
+
 def main() -> None:
     argv = list(sys.argv[1:])
     if not _looks_like_minicut_exact_keep(argv):
@@ -233,19 +259,34 @@ def main() -> None:
     finally:
         source.close()
 
-    exact_frame_argv = _replace_keep_with_frames(argv, plan.frame_keep)
-    _run_upstream(exact_frame_argv)
-
-    # This check verifies SmartCut preserved the expected master-frame packet
-    # count. Decodability and exact edge-frame identity are verified separately
-    # by the real FFmpeg integration test; do not infer them from container flags.
     output = Path(argv[1])
-    actual = _video_frame_count(output)
-    if actual != plan.expected_frames:
-        raise RuntimeError(
-            "SmartCut menghasilkan jumlah frame yang tidak sesuai boundary exact: "
-            f"hasil {actual}, seharusnya {plan.expected_frames}."
+    actual = _run_and_count_decoded(argv, plan.frame_keep, output)
+    if actual == plan.expected_frames:
+        return
+
+    # SmartCut 1.7 can produce the correct packet count while MP4 decoding drops
+    # the final frame. Recover only the exact known shape: one decoded frame
+    # missing at a non-terminal end boundary. Any other mismatch remains fatal.
+    if (
+        actual == plan.expected_frames - 1
+        and plan.recovery_frame_keep is not None
+    ):
+        recovered = _run_and_count_decoded(
+            argv,
+            plan.recovery_frame_keep,
+            output,
         )
+        if recovered == plan.expected_frames:
+            return
+        raise RuntimeError(
+            "SmartCut retry boundary exact tetap tidak sesuai jumlah frame terdecode: "
+            f"awal {actual}, retry {recovered}, seharusnya {plan.expected_frames}."
+        )
+
+    raise RuntimeError(
+        "SmartCut menghasilkan jumlah frame terdecode yang tidak sesuai boundary exact: "
+        f"hasil {actual}, seharusnya {plan.expected_frames}."
+    )
 
 
 if __name__ == "__main__":
