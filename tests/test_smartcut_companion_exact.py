@@ -34,18 +34,19 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "grid time_base"):
             smartcut_runner._exact_frame_index(source, "1/100")
 
-    def test_part_before_boundary_expects_k_frames_and_builds_one_frame_retry(self):
+    def test_part_before_boundary_maps_half_open_range_to_inclusive_frame_cli(self):
         source = _FakeSource()
         plan = smartcut_runner._build_exact_keep_plan(source, "start,97/24")
         self.assertEqual(plan.expected_frames, 97)
-        # Retry end is frame K+1, relative to the same zero-based timeline.
-        self.assertEqual(plan.retry_keep, "start,49/12")
+        # MiniCut [0,97) becomes SmartCut --frames 0,96. SmartCut itself
+        # advances the inclusive end frame to the next PTS internally.
+        self.assertEqual(plan.frame_keep, "0,96")
 
     def test_part_after_boundary_starts_at_k_and_keeps_remaining_frames(self):
         source = _FakeSource()
         plan = smartcut_runner._build_exact_keep_plan(source, "97/24,end")
         self.assertEqual(plan.expected_frames, 200 - 97)
-        self.assertIsNone(plan.retry_keep)
+        self.assertEqual(plan.frame_keep, "97,-1")
 
     def test_exact_fraction_syntax_activates_hardening_on_staging_output(self):
         final_name = [
@@ -77,8 +78,8 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
         )
 
 
-class SmartCutExactFrameRetryTests(unittest.TestCase):
-    def test_main_retries_only_one_missing_final_frame_on_staging_output(self):
+class SmartCutExactFrameExecutionTests(unittest.TestCase):
+    def test_main_uses_official_frame_mode_for_exact_staging_output(self):
         source = _FakeSource()
         argv = [
             "MiniCut SmartCut.exe",
@@ -102,21 +103,18 @@ class SmartCutExactFrameRetryTests(unittest.TestCase):
             side_effect=record_run,
         ), patch(
             "smartcut_runner._video_frame_count",
-            side_effect=[96, 97],
+            return_value=97,
         ):
             smartcut_runner.main()
 
-        self.assertEqual(len(runs), 2)
+        self.assertEqual(len(runs), 1)
         self.assertEqual(
             runs[0][runs[0].index("--keep") + 1],
-            "start,97/24",
+            "0,96",
         )
-        self.assertEqual(
-            runs[1][runs[1].index("--keep") + 1],
-            "start,49/12",
-        )
+        self.assertIn("--frames", runs[0])
 
-    def test_main_rejects_mismatch_larger_than_one_frame(self):
+    def test_main_rejects_output_frame_count_mismatch(self):
         source = _FakeSource()
         argv = [
             "MiniCut SmartCut.exe",
