@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from fractions import Fraction
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import smartcut_runner
@@ -22,6 +23,61 @@ class _FakeSource:
 
     def close(self):
         self.closed = True
+
+
+class SmartCutPacketDurationSeedTests(unittest.TestCase):
+    def test_duration_seed_uses_master_pts_delta_without_rounding(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 512, 1024, 1536])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 12288),
+                Fraction(1, 12288),
+            ),
+            512,
+        )
+
+    def test_duration_seed_converts_exactly_to_output_time_base(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1001, 2002, 3003])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 30000),
+                Fraction(1, 90000),
+            ),
+            3003,
+        )
+
+    def test_duration_seed_uses_most_common_positive_delta(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1000, 2001, 3001, 4001])
+        self.assertEqual(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 1000),
+                Fraction(1, 1000),
+            ),
+            1000,
+        )
+
+    def test_duration_seed_refuses_fractional_output_tick(self):
+        media = SimpleNamespace(video_frame_times_pts=[0, 1, 2])
+        self.assertIsNone(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 3),
+                Fraction(1, 2),
+            )
+        )
+
+    def test_duration_seed_requires_two_master_pts(self):
+        media = SimpleNamespace(video_frame_times_pts=[123])
+        self.assertIsNone(
+            smartcut_runner._master_frame_duration_in_output_ticks(
+                media,
+                Fraction(1, 24),
+                Fraction(1, 24),
+            )
+        )
 
 
 class SmartCutExactFramePlanTests(unittest.TestCase):
