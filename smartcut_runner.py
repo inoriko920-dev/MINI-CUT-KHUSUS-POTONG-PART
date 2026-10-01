@@ -59,7 +59,10 @@ def _master_frame_duration_in_output_ticks(
     not dominate. Return None rather than round when the duration is not exactly
     representable in the output time base.
     """
-    raw_pts = list(getattr(media_container, "video_frame_times_pts", []) or [])
+    raw_pts_source = getattr(media_container, "video_frame_times_pts", None)
+    if raw_pts_source is None:
+        return None
+    raw_pts = list(raw_pts_source)
     if len(raw_pts) < 2:
         return None
 
