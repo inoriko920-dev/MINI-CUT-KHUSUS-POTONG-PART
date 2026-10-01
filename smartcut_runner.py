@@ -10,11 +10,11 @@ memetakan exact PTS ke indeks frame master tanpa toleransi lalu meneruskannya ke
 mode ``--frames`` resmi SmartCut.
 
 SmartCut 1.7 memiliki bug MP4 di ujung segmen: packet terakhir hasil recode dapat
-memiliki duration kosong/0 sehingga muxer membuat edit-list yang menandai frame
-terakhir sebagai discard. Upstream memperbaikinya setelah 1.7 dengan menyimpan
-duration packet valid sebelumnya dan menggunakannya pada packet yang duration-nya
-hilang. MiniCut membackport fix kecil itu di companion ini tanpa memodifikasi
-paket SmartCut yang terpasang.
+memiliki duration kosong/0 sehingga muxer membuat edit-list yang dapat membuat
+frame terakhir tidak terdecode. Upstream memperbaikinya setelah 1.7 dengan
+menyimpan duration packet valid sebelumnya dan menggunakannya pada packet yang
+duration-nya hilang. MiniCut membackport fix kecil itu di companion ini tanpa
+memodifikasi paket SmartCut yang terpasang.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-import av
 from smartcut.media_container import MediaContainer
 from smartcut.cut_video import VideoCutter
 
@@ -46,10 +45,10 @@ def _init_without_embedded_subtitles(self, *args, **kwargs):
 def _ensure_packet_duration(cutter: Any, packet: Any) -> None:
     """Backport upstream post-1.7 fix for missing final packet duration.
 
-    SmartCut upstream commit 9d8dbae57d1c added this exact policy because MP4
-    muxers can create an edit-list that discards the last frame when duration is
-    missing/zero. Keep the last known positive duration and apply it only when
-    the current packet has no valid duration.
+    SmartCut upstream commit 9d8dbae57d1c added this policy because MP4 muxers
+    can create an edit-list that effectively drops the final decoded frame when
+    duration is missing/zero. Keep the last known positive duration and apply it
+    only when the current packet has no valid duration.
     """
     duration = getattr(packet, "duration", None)
     if duration is not None and int(duration) > 0:
@@ -202,18 +201,6 @@ def _video_frame_count(path: Path) -> int:
         media.close()
 
 
-def _discard_video_packet_count(path: Path) -> int:
-    """Return video packets that the container marks as discard."""
-    container = av.open(str(path), mode="r")
-    try:
-        if not container.streams.video:
-            raise RuntimeError("Output SmartCut tidak memiliki video stream.")
-        stream = container.streams.video[0]
-        return sum(1 for packet in container.demux(stream) if packet.is_discard)
-    finally:
-        container.close()
-
-
 def _run_upstream(argv: list[str]) -> None:
     previous = list(sys.argv)
     try:
@@ -249,19 +236,15 @@ def main() -> None:
     exact_frame_argv = _replace_keep_with_frames(argv, plan.frame_keep)
     _run_upstream(exact_frame_argv)
 
+    # This check verifies SmartCut preserved the expected master-frame packet
+    # count. Decodability and exact edge-frame identity are verified separately
+    # by the real FFmpeg integration test; do not infer them from container flags.
     output = Path(argv[1])
     actual = _video_frame_count(output)
     if actual != plan.expected_frames:
         raise RuntimeError(
             "SmartCut menghasilkan jumlah frame yang tidak sesuai boundary exact: "
             f"hasil {actual}, seharusnya {plan.expected_frames}."
-        )
-
-    discarded = _discard_video_packet_count(output)
-    if discarded:
-        raise RuntimeError(
-            "SmartCut menghasilkan packet video ber-flag discard; "
-            f"jumlah={discarded}. Boundary exact tidak dapat dianggap valid."
         )
 
 
