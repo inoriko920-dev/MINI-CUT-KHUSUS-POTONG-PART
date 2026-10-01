@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from fractions import Fraction
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import smartcut_runner
@@ -24,6 +25,33 @@ class _FakeSource:
         self.closed = True
 
 
+class SmartCutPacketDurationBackportTests(unittest.TestCase):
+    def test_positive_duration_becomes_typical_duration(self):
+        cutter = SimpleNamespace(typical_frame_duration=None)
+        packet = SimpleNamespace(duration=1001)
+        smartcut_runner._ensure_packet_duration(cutter, packet)
+        self.assertEqual(cutter.typical_frame_duration, 1001)
+        self.assertEqual(packet.duration, 1001)
+
+    def test_zero_duration_uses_previous_positive_duration(self):
+        cutter = SimpleNamespace(typical_frame_duration=1001)
+        packet = SimpleNamespace(duration=0)
+        smartcut_runner._ensure_packet_duration(cutter, packet)
+        self.assertEqual(packet.duration, 1001)
+
+    def test_none_duration_uses_previous_positive_duration(self):
+        cutter = SimpleNamespace(typical_frame_duration=512)
+        packet = SimpleNamespace(duration=None)
+        smartcut_runner._ensure_packet_duration(cutter, packet)
+        self.assertEqual(packet.duration, 512)
+
+    def test_missing_duration_stays_missing_without_known_typical_duration(self):
+        cutter = SimpleNamespace(typical_frame_duration=None)
+        packet = SimpleNamespace(duration=None)
+        smartcut_runner._ensure_packet_duration(cutter, packet)
+        self.assertIsNone(packet.duration)
+
+
 class SmartCutExactFramePlanTests(unittest.TestCase):
     def test_exact_boundary_maps_to_master_frame_index_without_tolerance(self):
         source = _FakeSource()
@@ -34,21 +62,17 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "grid time_base"):
             smartcut_runner._exact_frame_index(source, "1/100")
 
-    def test_part_before_boundary_maps_half_open_range_and_prepares_guarded_retry(self):
+    def test_part_before_boundary_maps_half_open_range_to_inclusive_frame_cli(self):
         source = _FakeSource()
         plan = smartcut_runner._build_exact_keep_plan(source, "start,97/24")
         self.assertEqual(plan.expected_frames, 97)
         self.assertEqual(plan.frame_keep, "0,96")
-        # Retry is not automatic. This candidate is used only when decoded-tail
-        # verification proves the normal export lost exactly one final frame.
-        self.assertEqual(plan.retry_frame_keep, "0,97")
 
-    def test_part_after_boundary_starts_at_k_and_terminal_end_has_no_retry(self):
+    def test_part_after_boundary_starts_at_k_and_keeps_remaining_frames(self):
         source = _FakeSource()
         plan = smartcut_runner._build_exact_keep_plan(source, "97/24,end")
         self.assertEqual(plan.expected_frames, 200 - 97)
         self.assertEqual(plan.frame_keep, "97,-1")
-        self.assertIsNone(plan.retry_frame_keep)
 
     def test_exact_fraction_syntax_activates_hardening_on_staging_output(self):
         final_name = [
@@ -79,15 +103,6 @@ class SmartCutExactFramePlanTests(unittest.TestCase):
             smartcut_runner._looks_like_minicut_exact_keep(rounded_fallback)
         )
 
-    def test_decode_stats_subtract_only_proven_missing_tail_frames(self):
-        stats = smartcut_runner._OutputDecodeStats(
-            packet_frames=97,
-            tail_packets=20,
-            tail_decoded=19,
-        )
-        self.assertEqual(stats.tail_missing, 1)
-        self.assertEqual(stats.effective_decoded_frames, 96)
-
 
 class SmartCutExactFrameExecutionTests(unittest.TestCase):
     def _argv(self, keep: str = "start,97/24") -> list[str]:
@@ -101,10 +116,9 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
             "warning",
         ]
 
-    def test_main_accepts_exact_output_without_retry(self):
+    def test_main_uses_official_frame_mode_and_accepts_clean_output(self):
         source = _FakeSource()
         runs: list[list[str]] = []
-
         with patch.object(sys, "argv", self._argv()), patch(
             "smartcut_runner.MediaContainer",
             return_value=source,
@@ -112,46 +126,19 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
             "smartcut_runner._run_upstream",
             side_effect=lambda args: runs.append(list(args)),
         ), patch(
-            "smartcut_runner._output_decode_stats",
-            return_value=smartcut_runner._OutputDecodeStats(97, 20, 20),
+            "smartcut_runner._video_frame_count",
+            return_value=97,
+        ), patch(
+            "smartcut_runner._discard_video_packet_count",
+            return_value=0,
         ):
             smartcut_runner.main()
 
         self.assertEqual(len(runs), 1)
-        self.assertEqual(
-            runs[0][runs[0].index("--keep") + 1],
-            "0,96",
-        )
+        self.assertEqual(runs[0][runs[0].index("--keep") + 1], "0,96")
         self.assertIn("--frames", runs[0])
 
-    def test_main_retries_one_extra_source_frame_only_after_decode_proof(self):
-        source = _FakeSource()
-        runs: list[list[str]] = []
-        stats = [
-            # Packet inventory says 97 but final GOP decodes only 96.
-            smartcut_runner._OutputDecodeStats(97, 20, 19),
-            # Retry exposes one sacrificial packet; exactly 97 remain decodable.
-            smartcut_runner._OutputDecodeStats(98, 21, 20),
-        ]
-
-        with patch.object(sys, "argv", self._argv()), patch(
-            "smartcut_runner.MediaContainer",
-            return_value=source,
-        ), patch(
-            "smartcut_runner._run_upstream",
-            side_effect=lambda args: runs.append(list(args)),
-        ), patch(
-            "smartcut_runner._output_decode_stats",
-            side_effect=stats,
-        ):
-            smartcut_runner.main()
-
-        self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[0][runs[0].index("--keep") + 1], "0,96")
-        self.assertEqual(runs[1][runs[1].index("--keep") + 1], "0,97")
-        self.assertIn("--frames", runs[1])
-
-    def test_main_does_not_retry_unrelated_mismatch(self):
+    def test_main_rejects_output_frame_count_mismatch(self):
         source = _FakeSource()
         with patch.object(sys, "argv", self._argv()), patch(
             "smartcut_runner.MediaContainer",
@@ -159,30 +146,13 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
         ), patch(
             "smartcut_runner._run_upstream",
         ), patch(
-            "smartcut_runner._output_decode_stats",
-            return_value=smartcut_runner._OutputDecodeStats(95, 20, 20),
+            "smartcut_runner._video_frame_count",
+            return_value=96,
         ):
-            with self.assertRaisesRegex(RuntimeError, "verifikasi decode"):
+            with self.assertRaisesRegex(RuntimeError, "jumlah frame"):
                 smartcut_runner.main()
 
-    def test_main_does_not_extend_past_terminal_end(self):
-        source = _FakeSource()
-        runs: list[list[str]] = []
-        with patch.object(sys, "argv", self._argv("97/24,end")), patch(
-            "smartcut_runner.MediaContainer",
-            return_value=source,
-        ), patch(
-            "smartcut_runner._run_upstream",
-            side_effect=lambda args: runs.append(list(args)),
-        ), patch(
-            "smartcut_runner._output_decode_stats",
-            return_value=smartcut_runner._OutputDecodeStats(103, 20, 19),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "verifikasi decode"):
-                smartcut_runner.main()
-        self.assertEqual(len(runs), 1)
-
-    def test_retry_must_itself_match_exact_decoded_contract(self):
+    def test_main_rejects_discard_flag_even_when_packet_count_matches(self):
         source = _FakeSource()
         with patch.object(sys, "argv", self._argv()), patch(
             "smartcut_runner.MediaContainer",
@@ -190,13 +160,13 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
         ), patch(
             "smartcut_runner._run_upstream",
         ), patch(
-            "smartcut_runner._output_decode_stats",
-            side_effect=[
-                smartcut_runner._OutputDecodeStats(97, 20, 19),
-                smartcut_runner._OutputDecodeStats(98, 21, 21),
-            ],
+            "smartcut_runner._video_frame_count",
+            return_value=97,
+        ), patch(
+            "smartcut_runner._discard_video_packet_count",
+            return_value=1,
         ):
-            with self.assertRaisesRegex(RuntimeError, "retry satu-frame"):
+            with self.assertRaisesRegex(RuntimeError, "discard"):
                 smartcut_runner.main()
 
 
