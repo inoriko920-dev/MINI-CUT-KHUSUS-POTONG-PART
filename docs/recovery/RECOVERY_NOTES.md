@@ -1,7 +1,14 @@
 # MiniCut Recovery R0
 
-Recovery baseline bootstrap created on 2026-10-01.
+Verified source was recovered from the accessible legacy repository:
+`tonitarung099-creator/Mini-Cut-Khusus-Potong-Part-`.
 
-Verified source baseline: `tonitarung099-creator/Mini-Cut-Khusus-Potong-Part-` at commit `6d91b261f976574d106d12a943bbedb5c0527216`.
+Exact source baseline commit:
+`6d91b261f976574d106d12a943bbedb5c0527216`
 
-Source files imported into this repository must be byte-for-byte derived from that verified Git tree unless explicitly labeled otherwise.
+Exact legacy Git tree:
+`040124052a3a974f1285f7cf6c0ff60aaff749b7`
+
+The recovery importer verified that a clean extraction of the legacy commit produced the exact legacy tree SHA before recovery documentation was added. GitHub workflow files are applied separately through the authenticated GitHub connector because the Actions token cannot modify workflow files.
+
+`MiniCut-Windows.zip` is build evidence only and is not used as a source substitute.

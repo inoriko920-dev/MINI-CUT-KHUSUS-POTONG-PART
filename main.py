@@ -1,0 +1,66 @@
+import sys
+from pathlib import Path
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+from minicut_agent.bulk_api_window import BulkApiRuntimeMiniCutWindow as RuntimeMiniCutWindow
+
+def main():
+    app = QApplication(sys.argv)
+    win = RuntimeMiniCutWindow()
+    win.show()
+    if "--self-test-player" in sys.argv:
+        def verify_player_backend():
+            if win.player.using_mpv:
+                print("player-backend-ok: mpv")
+                app.exit(0)
+            else:
+                print("player-backend-failed: " + win.player.backend_name)
+                app.exit(3)
+        QTimer.singleShot(1800, verify_player_backend)
+    elif "--self-test-layout" in sys.argv:
+        def verify_layout():
+            try:
+                win.resize(1120, 680)
+                app.processEvents()
+                issues = win.ui_layout_issues()
+
+                # Keep real Windows screenshots for visual inspection in CI.
+                screen_dir = Path("ui-layout-screens")
+                screen_dir.mkdir(parents=True, exist_ok=True)
+                original_tab = win.tabs.currentIndex()
+                for index in range(win.tabs.count()):
+                    win.tabs.setCurrentIndex(index)
+                    app.processEvents()
+                    safe_name = "".join(
+                        ch if ch.isalnum() else "-"
+                        for ch in win.tabs.tabText(index).strip().lower()
+                    ).strip("-") or f"tab-{index + 1}"
+                    win.grab().save(
+                        str(screen_dir / f"{index + 1:02d}-{safe_name}.png")
+                    )
+                win.tabs.setCurrentIndex(original_tab)
+                app.processEvents()
+
+                if issues:
+                    for issue in issues:
+                        print("layout-failed: " + issue, flush=True)
+                    app.exit(4)
+                else:
+                    print(
+                        "layout-ok: no overlapping or clipped interactive controls",
+                        flush=True,
+                    )
+                    app.exit(0)
+            except Exception as exc:
+                print(
+                    f"layout-exception: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                app.exit(5)
+        QTimer.singleShot(1600, verify_layout)
+    elif "--self-test" in sys.argv:
+        QTimer.singleShot(1200, app.quit)
+    raise SystemExit(app.exec())
+
+if __name__ == "__main__":
+    main()

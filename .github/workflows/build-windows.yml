@@ -1,0 +1,204 @@
+name: Build MiniCut Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Prepare libmpv runtime
+        shell: pwsh
+        run: |
+          ./scripts/fetch_mpv.ps1
+
+      - name: Prepare FFmpeg runtime
+        shell: pwsh
+        run: |
+          ./scripts/fetch_ffmpeg.ps1
+
+      - name: Smoke test FFmpeg runtime
+        shell: pwsh
+        run: |
+          & "ffmpeg-runtime/ffmpeg.exe" -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "ffmpeg-runtime/ffprobe.exe" -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test libmpv runtime
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem "mpv-runtime" -Recurse -File -Filter "*.dll" | Where-Object {
+            $_.Name -match "^(libmpv|mpv)-?2?\.dll$"
+          } | Select-Object -First 1
+          if (-not $dll) { throw "libmpv DLL not found" }
+          $env:PATH = "$($dll.DirectoryName);$env:PATH"
+          python -c "import mpv; p=mpv.MPV(vo='null', ao='null'); print('libmpv-ok', mpv.MPV_VERSION); p.terminate()"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile and import checks
+        shell: pwsh
+        run: |
+          python -m compileall -q minicut_agent main.py mcp_server.py smartcut_runner.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "from minicut_agent.verified_window import VerifiedMiniCutWindow; from minicut_agent.gemini_keys import GeminiKeyStore; print('ui-import-ok')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import mcp_server; print('mcp-import-ok')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Unit tests
+        shell: pwsh
+        env:
+          MINICUT_FFMPEG: ${{ github.workspace }}\ffmpeg-runtime\ffmpeg.exe
+          MINICUT_FFPROBE: ${{ github.workspace }}\ffmpeg-runtime\ffprobe.exe
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build MiniCut Studio Agent
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name "MiniCut Studio Agent" --hidden-import PySide6.QtMultimedia --hidden-import PySide6.QtMultimediaWidgets --hidden-import mpv --collect-data tzdata main.py
+          Get-ChildItem "mpv-runtime" -Recurse -File -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "dist/MiniCut Studio Agent/" -Force
+          }
+          Copy-Item THIRD_PARTY_MPV.txt "dist/MiniCut Studio Agent/THIRD_PARTY_MPV.txt"
+          Copy-Item "ffmpeg-runtime/ffmpeg.exe" "dist/MiniCut Studio Agent/ffmpeg.exe" -Force
+          Copy-Item "ffmpeg-runtime/ffprobe.exe" "dist/MiniCut Studio Agent/ffprobe.exe" -Force
+          Copy-Item THIRD_PARTY_FFMPEG.txt "dist/MiniCut Studio Agent/THIRD_PARTY_FFMPEG.txt" -Force
+          if (Test-Path "ffmpeg-runtime/FFMPEG_BUILD_LICENSE.txt") {
+            Copy-Item "ffmpeg-runtime/FFMPEG_BUILD_LICENSE.txt" "dist/MiniCut Studio Agent/FFMPEG_BUILD_LICENSE.txt" -Force
+          }
+
+      - name: Build MCP companion
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --console --contents-directory _mcp_internal --name "MiniCut MCP" mcp_server.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "dist/MiniCut MCP/MiniCut MCP.exe" "dist/MiniCut Studio Agent/MiniCut MCP.exe"
+          Copy-Item "dist/MiniCut MCP/_mcp_internal" "dist/MiniCut Studio Agent/" -Recurse -Force
+          Copy-Item README.md "dist/MiniCut Studio Agent/README_AGENT.md"
+
+      - name: Smoke test packaged MCP companion
+        shell: pwsh
+        run: |
+          & "dist/MiniCut Studio Agent/MiniCut MCP.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build SmartCut companion
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --console --name "MiniCut SmartCut" --collect-all smartcut --collect-all av smartcut_runner.py
+          Copy-Item "dist/MiniCut SmartCut.exe" "dist/MiniCut Studio Agent/MiniCut SmartCut.exe"
+          Copy-Item THIRD_PARTY_SMARTCUT.txt "dist/MiniCut Studio Agent/THIRD_PARTY_SMARTCUT.txt"
+
+      - name: Smoke test SmartCut companion
+        shell: pwsh
+        run: |
+          & "dist/MiniCut Studio Agent/MiniCut SmartCut.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify real exported boundary frames
+        shell: pwsh
+        env:
+          MINICUT_FFMPEG: ${{ github.workspace }}\ffmpeg-runtime\ffmpeg.exe
+          MINICUT_FFPROBE: ${{ github.workspace }}\ffmpeg-runtime\ffprobe.exe
+          MINICUT_SMARTCUT_EXE: ${{ github.workspace }}\dist\MiniCut Studio Agent\MiniCut SmartCut.exe
+        run: |
+          python -m unittest discover -s tests -p "test_camera_boundary_integration.py" -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/MiniCut Studio Agent/MiniCut Studio Agent.exe" -ArgumentList "--self-test" -PassThru
+          if (-not $p.WaitForExit(30000)) {
+            $p.Kill()
+            throw "MiniCut self-test timeout"
+          }
+          $p.Refresh()
+          if ($p.ExitCode -ne 0) {
+            throw "MiniCut self-test failed with exit code $($p.ExitCode)"
+          }
+
+      - name: Verify packaged FFmpeg tools
+        shell: pwsh
+        run: |
+          & "dist/MiniCut Studio Agent/ffmpeg.exe" -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "dist/MiniCut Studio Agent/ffprobe.exe" -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify packaged mpv backend
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/MiniCut Studio Agent/MiniCut Studio Agent.exe" -ArgumentList "--self-test-player" -PassThru
+          if (-not $p.WaitForExit(30000)) {
+            $p.Kill()
+            throw "MiniCut mpv backend self-test timeout"
+          }
+          $p.Refresh()
+          if ($p.ExitCode -ne 0) {
+            throw "MiniCut packaged mpv backend unavailable; exit code $($p.ExitCode)"
+          }
+
+      - name: Smoke test compact UI layout
+        shell: pwsh
+        run: |
+          $stdout = Join-Path $env:RUNNER_TEMP "minicut-layout-out.txt"
+          $stderr = Join-Path $env:RUNNER_TEMP "minicut-layout-err.txt"
+          $p = Start-Process -FilePath "dist/MiniCut Studio Agent/MiniCut Studio Agent.exe" -ArgumentList "--self-test-layout" -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if (-not $p.WaitForExit(30000)) {
+            $p.Kill()
+            throw "MiniCut layout self-test timeout"
+          }
+          $p.Refresh()
+          if (Test-Path $stdout) { Get-Content $stdout }
+          if (Test-Path $stderr) { Get-Content $stderr }
+          if ($p.ExitCode -ne 0) {
+            throw "MiniCut layout self-test failed with exit code $($p.ExitCode)"
+          }
+
+      - name: Upload UI check screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MiniCut-UI-Check
+          path: ui-layout-screens
+          if-no-files-found: warn
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/MiniCut Studio Agent/*" -DestinationPath "MiniCut-Windows.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MiniCut-Windows
+          path: MiniCut-Windows.zip
+          if-no-files-found: error
