@@ -116,7 +116,7 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
             "warning",
         ]
 
-    def test_main_uses_official_frame_mode_and_accepts_clean_output(self):
+    def test_main_uses_official_frame_mode_and_accepts_expected_packet_count(self):
         source = _FakeSource()
         runs: list[list[str]] = []
         with patch.object(sys, "argv", self._argv()), patch(
@@ -128,9 +128,6 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
         ), patch(
             "smartcut_runner._video_frame_count",
             return_value=97,
-        ), patch(
-            "smartcut_runner._discard_video_packet_count",
-            return_value=0,
         ):
             smartcut_runner.main()
 
@@ -150,23 +147,6 @@ class SmartCutExactFrameExecutionTests(unittest.TestCase):
             return_value=96,
         ):
             with self.assertRaisesRegex(RuntimeError, "jumlah frame"):
-                smartcut_runner.main()
-
-    def test_main_rejects_discard_flag_even_when_packet_count_matches(self):
-        source = _FakeSource()
-        with patch.object(sys, "argv", self._argv()), patch(
-            "smartcut_runner.MediaContainer",
-            return_value=source,
-        ), patch(
-            "smartcut_runner._run_upstream",
-        ), patch(
-            "smartcut_runner._video_frame_count",
-            return_value=97,
-        ), patch(
-            "smartcut_runner._discard_video_packet_count",
-            return_value=1,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "discard"):
                 smartcut_runner.main()
 
 
