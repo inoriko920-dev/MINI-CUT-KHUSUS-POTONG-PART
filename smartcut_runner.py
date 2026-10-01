@@ -12,15 +12,19 @@ mode ``--frames`` resmi SmartCut.
 Dependency SmartCut dipin ke upstream commit
 ``9d8dbae57d1cad3597956e10cf746d3170adf72c``. Snapshot itu berada setelah
 perbaikan finalisasi GOP terakhir, kondisi finalisasi GOP, dan durasi frame yang
-valid. Companion tidak menambal algoritma encoding SmartCut; ia hanya menjaga
-kebijakan subtitle MiniCut, pemetaan exact frame, dan memverifikasi jumlah frame
-yang benar-benar dapat didecode sesudah ekspor.
+valid. SmartCut mempelajari ``typical_frame_duration`` dari packet output yang
+sudah mempunyai duration positif. Pada segmen pertama yang seluruhnya direcode,
+encoder tertentu dapat menghasilkan packet duration 0 sehingga nilai tipikal
+belum pernah terisi sebelum packet terakhir dimux ke MP4. Companion men-seed
+nilai fallback itu dari delta PTS frame master sumber; packet dengan duration
+positif dari SmartCut tetap dapat menggantinya seperti biasa.
 """
 
 from __future__ import annotations
 
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -28,9 +32,11 @@ from typing import Any
 
 import av
 from smartcut.media_container import MediaContainer
+from smartcut.video_cutter import VideoCutter
 
 
 _original_media_container_init = MediaContainer.__init__
+_original_video_cutter_init = VideoCutter.__init__
 
 
 def _init_without_embedded_subtitles(self, *args, **kwargs):
@@ -41,7 +47,53 @@ def _init_without_embedded_subtitles(self, *args, **kwargs):
     self.subtitle_tracks = []
 
 
+def _master_frame_duration_in_output_ticks(
+    media_container: Any,
+    in_time_base: Any,
+    out_time_base: Any,
+) -> int | None:
+    """Derive a conservative packet-duration fallback from exact master PTS.
+
+    Use the most common positive delta among the first master frames so CFR
+    sources get their exact cadence while a single timestamp irregularity does
+    not dominate. Return None rather than round when the duration is not exactly
+    representable in the output time base.
+    """
+    raw_pts = list(getattr(media_container, "video_frame_times_pts", []) or [])
+    if len(raw_pts) < 2:
+        return None
+
+    samples = raw_pts[:65]
+    deltas = [
+        int(right) - int(left)
+        for left, right in zip(samples, samples[1:])
+        if int(right) > int(left)
+    ]
+    if not deltas:
+        return None
+
+    delta_pts = Counter(deltas).most_common(1)[0][0]
+    duration = Fraction(delta_pts, 1) * _as_fraction(in_time_base) / _as_fraction(out_time_base)
+    if duration.denominator != 1 or duration.numerator <= 0:
+        return None
+    return int(duration.numerator)
+
+
+def _video_cutter_init_with_seeded_duration(self, *args, **kwargs):
+    _original_video_cutter_init(self, *args, **kwargs)
+    if getattr(self, "typical_frame_duration", None) is not None:
+        return
+    duration = _master_frame_duration_in_output_ticks(
+        getattr(self, "media_container", None),
+        getattr(self, "in_time_base", None),
+        getattr(self, "out_time_base", None),
+    )
+    if duration is not None:
+        self.typical_frame_duration = duration
+
+
 MediaContainer.__init__ = _init_without_embedded_subtitles
+VideoCutter.__init__ = _video_cutter_init_with_seeded_duration
 
 from smartcut.__main__ import main as _smartcut_main  # noqa: E402
 
