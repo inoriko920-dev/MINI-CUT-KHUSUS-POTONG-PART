@@ -28,7 +28,7 @@ from typing import Any
 
 import av
 from smartcut.media_container import MediaContainer
-from smartcut.video_cutter import VideoCutter
+from smartcut.cut_video import VideoCutter
 
 
 _original_media_container_init = MediaContainer.__init__
